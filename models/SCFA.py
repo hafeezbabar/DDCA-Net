@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ParallelActivation(nn.Module):
+class MixActivation(nn.Module):
     def __init__(self):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(1))
@@ -10,23 +10,17 @@ class ParallelActivation(nn.Module):
     def forward(self, x):
         return self.alpha * torch.tanh(x) + (1-self.alpha) * F.hardswish(x)
 
-class EnhancedDepthChannelAtt2(nn.Module):
+class DepthChannelEnhancer(nn.Module):
     def __init__(self, dim, kernel=3) -> None:
         super().__init__()
         self.kernel = (1, kernel)
         pad_r = pad_l = kernel // 2
         self.pad = nn.ReflectionPad2d((pad_r, pad_l, 0, 0))
         
-        # Dynamic channel grouping
         self.groups = max(1, dim // 16)
-        self.conv = nn.Conv2d(dim, kernel*dim, kernel_size=1, 
-                            stride=1, bias=False, groups=self.groups)
-        
+        self.conv = nn.Conv2d(dim, kernel*dim, kernel_size=1, stride=1, bias=False, groups=self.groups)
         self.gap = nn.AdaptiveAvgPool2d(1)
-        
-        # Replacing sequential activation with ParallelActivation
-        self.filter_act = ParallelActivation()
-        
+        self.filter_act = MixActivation()
         self.filter_bn = nn.GroupNorm(self.groups, kernel*dim)
         self.temp = nn.Parameter(torch.ones(1) * 0.05)
         
@@ -36,7 +30,6 @@ class EnhancedDepthChannelAtt2(nn.Module):
     def forward(self, x):
         filter = self.conv(self.gap(x))
         filter = self.filter_bn(filter)
-        # Using parallel activation
         filter = self.filter_act(filter) * self.temp.exp()
         
         b, c, h, w = filter.shape
@@ -51,42 +44,27 @@ class EnhancedDepthChannelAtt2(nn.Module):
         out = torch.sum(out * filter, dim=1, keepdim=True)
         out = out.permute(0,3,1,2).reshape(B,C,H,W)
         
-        return out * self.gamma + x * self.beta.
+        return out * self.gamma + x * self.beta
 
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class FrequencyDecomposition(nn.Module):
+class FreqFeatureSplit(nn.Module):
     def __init__(self, features):
-        super(FrequencyDecomposition, self).__init__()
+        super(FreqFeatureSplit, self).__init__()
         self.group_channels = features // 4
         
-        # Frequency splits using group convolutions
         self.C_llf = nn.Sequential(
-            nn.Conv2d(features, self.group_channels,
-                      kernel_size=3, stride=1, padding=4, dilation=4,
-                      groups=self.group_channels),
+            nn.Conv2d(features, self.group_channels, kernel_size=3, stride=1, padding=4, dilation=4, groups=self.group_channels),
             nn.LeakyReLU(inplace=True)
         )
         self.C_lf = nn.Sequential(
-            nn.Conv2d(features, self.group_channels,
-                      kernel_size=3, stride=1, padding=3, dilation=3,
-                      groups=self.group_channels),
+            nn.Conv2d(features, self.group_channels, kernel_size=3, stride=1, padding=3, dilation=3, groups=self.group_channels),
             nn.LeakyReLU(inplace=True)
         )
         self.C_mf = nn.Sequential(
-            nn.Conv2d(features, self.group_channels,
-                      kernel_size=3, stride=1, padding=2, dilation=2,
-                      groups=self.group_channels),
+            nn.Conv2d(features, self.group_channels, kernel_size=3, stride=1, padding=2, dilation=2, groups=self.group_channels),
             nn.LeakyReLU(inplace=True)
         )
         self.C_hf = nn.Sequential(
-            nn.Conv2d(features, self.group_channels,
-                      kernel_size=3, stride=1, padding=1, dilation=1,
-                      groups=self.group_channels),
+            nn.Conv2d(features, self.group_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=self.group_channels),
             nn.LeakyReLU(inplace=True)
         )
         self.R = nn.GELU()
@@ -98,9 +76,9 @@ class FrequencyDecomposition(nn.Module):
         hf = self.R(self.C_hf(x) - mf)      
         return torch.cat((llf, lf, mf, hf), dim=1)
 
-class Attention(nn.Module):
+class AdaptiveAttentionUnit(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, groups=1, reduction=0.0625, kernel_num=4, min_channel=16):
-        super(Attention, self).__init__()
+        super(AdaptiveAttentionUnit, self).__init__()
         attention_channel = max(int(in_planes * reduction), min_channel)
         self.kernel_size = kernel_size
         self.kernel_num = kernel_num
@@ -176,10 +154,10 @@ class Attention(nn.Module):
         x = self.relu(x)
         return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
 
-class ODConv2d2(nn.Module):
+class DynamicODConvLayer(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1,
                  reduction=0.0625, kernel_num=4):
-        super(ODConv2d2, self).__init__()
+        super(DynamicODConvLayer, self).__init__()
         self.in_planes = in_planes
         self.out_planes = out_planes
         self.kernel_size = kernel_size
@@ -189,15 +167,11 @@ class ODConv2d2(nn.Module):
         self.groups = groups
         self.kernel_num = kernel_num
         
-        # Add frequency decomposition
-        self.freq_decomp = FrequencyDecomposition(in_planes)
-        
-        # Attention now takes concatenated frequency features as input
-        self.attention = Attention(in_planes, out_planes, kernel_size, groups=groups,
-                                 reduction=reduction, kernel_num=kernel_num)
-                                 
+        self.freq_decomp = FreqFeatureSplit(in_planes)
+        self.attention = AdaptiveAttentionUnit(in_planes, out_planes, kernel_size, groups=groups,
+                                               reduction=reduction, kernel_num=kernel_num)
         self.weight = nn.Parameter(torch.randn(kernel_num, out_planes, in_planes//groups, kernel_size, kernel_size),
-                                 requires_grad=True)
+                                   requires_grad=True)
         self._initialize_weights()
 
         if self.kernel_size == 1 and self.kernel_num == 1:
@@ -213,11 +187,7 @@ class ODConv2d2(nn.Module):
         self.attention.update_temperature(temperature)
 
     def _forward_impl_common(self, x):
-        # First apply frequency decomposition
         freq_features = self.freq_decomp(x)
-        #print("shape of freq_features", freq_features.shape)
-        
-        # Get attention weights using frequency features
         channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(freq_features)
         
         batch_size, in_planes, height, width = x.size()
@@ -236,12 +206,8 @@ class ODConv2d2(nn.Module):
         return output
 
     def _forward_impl_pw1x(self, x):
-        # First apply frequency decomposition
         freq_features = self.freq_decomp(x)
-        
-        #print("shape of freq_features", freq_features.shape)
-        # Get attention weights using frequency features
-        channel_attention, filter_attention, spatial_attention, kernel_attention = self.attention(freq_features)
+        channel_attention, filter_attention, _, _ = self.attention(freq_features)
         
         x = x * channel_attention
         output = F.conv2d(x, weight=self.weight.squeeze(dim=0), bias=None, stride=self.stride, padding=self.padding,
@@ -258,11 +224,9 @@ def get_temperature(iteration, epoch, iter_per_epoch, temp_epoch=10, temp_init=3
     temperature = 1.0 + max(0, (temp_init - 1.0) * ((total_temp_iter - current_iter) / total_temp_iter))
     return temperature
 
-
-
-class BasicConv(nn.Module):
+class LiteConv(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, stride, bias=True, norm=False, relu=True, transpose=False):
-        super(BasicConv, self).__init__()
+        super(LiteConv, self).__init__()
         if bias and norm:
             bias = False
 
@@ -272,8 +236,7 @@ class BasicConv(nn.Module):
             padding = kernel_size // 2 -1
             layers.append(nn.ConvTranspose2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias))
         else:
-            layers.append(
-                nn.Conv2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias))
+            layers.append(nn.Conv2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias))
         if norm:
             layers.append(nn.BatchNorm2d(out_channel))
         if relu:
@@ -283,13 +246,13 @@ class BasicConv(nn.Module):
     def forward(self, x):
         return self.main(x)
 
-class ResBlock(nn.Module):
+class EnhancedResidualBlock(nn.Module):
     def __init__(self, in_channel, out_channel, filter=False):
-        super(ResBlock, self).__init__()
-        self.conv1 = BasicConv(in_channel, out_channel, kernel_size=3, stride=1, relu=True)
-        self.conv2 = BasicConv(out_channel, out_channel, kernel_size=3, stride=1, relu=False)
-        self.dyna_ch = EnhancedDepthChannelAtt2(in_channel) if filter else nn.Identity()
-        self.odconv = ODConv2d2(in_channel, in_channel, kernel_size=3, padding=1) if filter else nn.Identity()
+        super(EnhancedResidualBlock, self).__init__()
+        self.conv1 = LiteConv(in_channel, out_channel, kernel_size=3, stride=1, relu=True)
+        self.conv2 = LiteConv(out_channel, out_channel, kernel_size=3, stride=1, relu=False)
+        self.dyna_ch = DepthChannelEnhancer(in_channel) if filter else nn.Identity()
+        self.odconv = DynamicODConvLayer(in_channel, in_channel, kernel_size=3, padding=1) if filter else nn.Identity()
     
         self.proj = nn.Conv2d(out_channel, out_channel, 3, 1, 1, groups=out_channel)
         self.proj_act = nn.GELU()
@@ -301,5 +264,4 @@ class ResBlock(nn.Module):
         out = self.dyna_ch(out)
         out = self.odconv(out)
         out = self.conv2(out)
-        
         return out + x
